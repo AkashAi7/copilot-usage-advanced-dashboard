@@ -120,15 +120,31 @@ else
   fi
 fi
 
-# Docker daemon running?
-if ! docker info &>/dev/null; then
+# Docker daemon running? (use sudo since group membership may not be active yet)
+if ! sudo docker info &>/dev/null; then
   warn "Docker daemon is not running. Starting it..."
   sudo systemctl start docker 2>/dev/null || sudo service docker start 2>/dev/null || error "Could not start Docker daemon. Please start it manually."
-  sleep 2
-  if ! docker info &>/dev/null; then
+  sleep 3
+  if ! sudo docker info &>/dev/null; then
     error "Docker daemon failed to start. Check: sudo systemctl status docker"
   fi
   success "Docker daemon started"
+fi
+success "Docker daemon is running"
+
+# Check if we need sudo for docker commands (group membership not active yet)
+USE_SUDO=""
+if ! docker info &>/dev/null 2>&1; then
+  if sudo docker info &>/dev/null 2>&1; then
+    USE_SUDO="sudo"
+    warn "Docker group membership not active yet. Using 'sudo' for docker commands."
+    warn "After setup completes, log out and back in to use docker without sudo."
+  fi
+fi
+
+# Update COMPOSE_CMD with sudo if needed
+if [[ -n "$USE_SUDO" ]]; then
+  COMPOSE_CMD="$USE_SUDO $COMPOSE_CMD"
 fi
 
 # ── 2. Collect required inputs ────────────────────────────────────────────────
