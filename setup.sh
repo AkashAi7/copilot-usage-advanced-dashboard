@@ -51,12 +51,45 @@ echo -e "${RESET}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# ── 1. Prerequisites check ────────────────────────────────────────────────────
+# ── 1. Prerequisites check & auto-install ────────────────────────────────────
 header "Checking prerequisites"
 
 # Docker
 if ! command -v docker &>/dev/null; then
-  error "Docker is not installed. Install it from https://docs.docker.com/engine/install/"
+  warn "Docker not found. Installing Docker..."
+  
+  # Detect OS
+  if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    OS=$ID
+  else
+    error "Cannot detect OS. Please install Docker manually: https://docs.docker.com/engine/install/"
+  fi
+  
+  case $OS in
+    ubuntu|debian)
+      info "Installing Docker on $OS..."
+      sudo apt update -qq
+      sudo apt install -y docker.io
+      sudo systemctl start docker
+      sudo systemctl enable docker
+      sudo usermod -aG docker $USER
+      success "Docker installed successfully"
+      warn "You need to log out and back in for Docker group changes to take effect"
+      warn "Or run: newgrp docker"
+      ;;
+    centos|rhel|fedora)
+      info "Installing Docker on $OS..."
+      sudo yum install -y docker
+      sudo systemctl start docker
+      sudo systemctl enable docker
+      sudo usermod -aG docker $USER
+      success "Docker installed successfully"
+      ;;
+    *)
+      error "Unsupported OS: $OS. Please install Docker manually: https://docs.docker.com/engine/install/"
+      ;;
+  esac
 fi
 success "Docker found: $(docker --version | head -1)"
 
@@ -68,12 +101,34 @@ elif command -v docker-compose &>/dev/null; then
   COMPOSE_CMD="docker-compose"
   success "Docker Compose (v1) found: $(docker-compose --version | head -1)"
 else
-  error "Docker Compose not found. Install it from https://docs.docker.com/compose/install/"
+  warn "Docker Compose not found. Installing Docker Compose v2..."
+  
+  info "Downloading Docker Compose..."
+  sudo curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose
+  sudo chmod +x /usr/local/bin/docker-compose
+  
+  # Create plugin directory and symlink
+  sudo mkdir -p /usr/local/lib/docker/cli-plugins
+  sudo ln -sf /usr/local/bin/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
+  
+  if docker compose version &>/dev/null 2>&1; then
+    COMPOSE_CMD="docker compose"
+    success "Docker Compose installed: $(docker compose version --short)"
+  else
+    COMPOSE_CMD="docker-compose"
+    success "Docker Compose installed: $(/usr/local/bin/docker-compose --version)"
+  fi
 fi
 
 # Docker daemon running?
 if ! docker info &>/dev/null; then
-  error "Docker daemon is not running. Start it and re-run this script."
+  warn "Docker daemon is not running. Starting it..."
+  sudo systemctl start docker 2>/dev/null || sudo service docker start 2>/dev/null || error "Could not start Docker daemon. Please start it manually."
+  sleep 2
+  if ! docker info &>/dev/null; then
+    error "Docker daemon failed to start. Check: sudo systemctl status docker"
+  fi
+  success "Docker daemon started"
 fi
 
 # ── 2. Collect required inputs ────────────────────────────────────────────────
