@@ -596,92 +596,160 @@ class GitHubOrganizationManager:
             f"Initialized GitHubOrganizationManager for {self.slug_type}: {organization_slug}"
         )
 
+    def _fetch_report_data(self, url, label="metrics"):
+        """
+        Fetch report data from a GitHub Copilot metrics report endpoint (new API, 2026+).
+
+        The endpoint returns signed download URLs; this method downloads and parses
+        the NDJSON (newline-delimited JSON) content from each link.
+
+        New endpoints used:
+          - /orgs/{org}/copilot/metrics/reports/organization-28-day/latest
+          - /enterprises/{enterprise}/copilot/metrics/reports/enterprise-28-day/latest
+
+        Reference: https://docs.github.com/en/enterprise-cloud@latest/rest/copilot/copilot-usage-metrics
+        """
+        logger.info(f"Fetching report download links from: {url}")
+        api_response = github_api_request_handler(url, error_return_value={})
+
+        if not api_response or "download_links" not in api_response:
+            logger.warning(f"No download links received from {label} report API at: {url}")
+            return []
+
+        download_links = api_response.get("download_links", [])
+        report_start = api_response.get("report_start_day", "unknown")
+        report_end = api_response.get("report_end_day", "unknown")
+        logger.info(
+            f"Found {len(download_links)} download links for {label} "
+            f"(period: {report_start} to {report_end})"
+        )
+
+        all_records = []
+        for i, download_link in enumerate(download_links, 1):
+            try:
+                logger.info(f"Downloading {label} data from link {i}/{len(download_links)}")
+                # Do NOT send Authorization header to signed blob storage URLs
+                response = requests.get(download_link, headers={"Accept": "application/json"})
+
+                if response.status_code != 200:
+                    logger.error(
+                        f"Download link {i} failed with HTTP {response.status_code}: {response.text[:200]}"
+                    )
+                    continue
+
+                if not response.content:
+                    logger.warning(f"Download link {i} returned empty content, skipping")
+                    continue
+
+                # Try standard JSON first, fall back to NDJSON (newline-delimited)
+                try:
+                    parsed = response.json()
+                    if isinstance(parsed, list):
+                        all_records.extend(parsed)
+                        logger.info(f"Download link {i}: parsed JSON array with {len(parsed)} records")
+                    elif isinstance(parsed, dict):
+                        all_records.append(parsed)
+                        logger.info(f"Download link {i}: parsed JSON object, wrapped as single record")
+                except json.JSONDecodeError:
+                    logger.info(f"Download link {i}: not standard JSON, attempting NDJSON parse")
+                    count = 0
+                    for line in response.text.splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            all_records.append(json.loads(line))
+                            count += 1
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Download link {i}: failed to parse NDJSON line — {e}")
+                    logger.info(f"Download link {i}: parsed {count} NDJSON records")
+
+            except requests.exceptions.RequestException as req_error:
+                logger.error(f"Request error for download link {i}: {req_error}")
+            except Exception as e:
+                logger.error(f"Unexpected error processing download link {i}: {e}")
+
+        logger.info(f"Total records fetched for {label}: {len(all_records)}")
+        return all_records
+
     def get_copilot_usages(
         self,
-        team_slug="all",
+        team_slug="all",      # kept for API compatibility; team-level not available in new API
         save_to_json=True,
-        position_in_tree="leaf_team",
-        usage_or_metrics="metrics",
+        position_in_tree="leaf_team",  # kept for API compatibility
+        usage_or_metrics="metrics",    # kept for API compatibility
     ):
-        urls = {
-            self.organization_slug,
-            (
-                position_in_tree,
-                f"https://api.github.com/{self.api_type}/{self.organization_slug}/copilot/{usage_or_metrics}",
-            ),
-        }
-        if team_slug:
-            if team_slug != "all":
-                urls = {
-                    team_slug: (
-                        position_in_tree,
-                        f"https://api.github.com/{self.api_type}/{self.organization_slug}/team/{team_slug}/copilot/{usage_or_metrics}",
-                    )
-                }
-            else:
-                if self.teams:
-                    logger.info(
-                        f"Fetching Copilot usages for all teams, team count: {len(self.teams)}"
-                    )
-                    urls = {
-                        team["slug"]: (
-                            team["position_in_tree"],
-                            f"https://api.github.com/{self.api_type}/{self.organization_slug}/team/{team['slug']}/copilot/{usage_or_metrics}",
-                        )
-                        for team in self.teams
-                    }
+        """
+        Fetch Copilot usage metrics using the new report-based API endpoints.
 
-                    # add root team in case teams are too small
-                    urls.update(
-                        {
-                            "no-team": (
-                                "root_team",
-                                f"https://api.github.com/{self.api_type}/{self.organization_slug}/copilot/{usage_or_metrics}",
-                            )
-                        }
-                    )
-                else:
-                    logger.info(
-                        f"No teams found for {self.slug_type}: {self.organization_slug}, fetching {self.slug_type} usage. mock team slug: no-team. strongly recommend to create teams for the {self.slug_type} to get more accurate data."
-                    )
-                    urls = {
-                        "no-team": (
-                            "root_team",
-                            f"https://api.github.com/{self.api_type}/{self.organization_slug}/copilot/{usage_or_metrics}",
-                        )
-                    }
+        Replaces the legacy endpoints deprecated January 29, 2026 (sunset April 2, 2026):
+          - Legacy: GET /orgs/{org}/copilot/metrics          (direct JSON response)
+          - Legacy: GET /orgs/{org}/team/{team}/copilot/metrics
 
-        datas = {}
-        logger.info(
-            f"Fetching Copilot usages for {self.slug_type}: {self.organization_slug}, team: {team_slug}"
+        New endpoints used (X-GitHub-Api-Version: 2022-11-28):
+          - Org:        GET /orgs/{org}/copilot/metrics/reports/organization-28-day/latest
+          - Enterprise: GET /enterprises/{ent}/copilot/metrics/reports/enterprise-28-day/latest
+
+        The new API returns signed download URLs; actual data is NDJSON files.
+        Team-level breakdown is no longer available via the new API — data is org-level only.
+
+        Reference:
+          https://docs.github.com/en/enterprise-cloud@latest/rest/copilot/copilot-usage-metrics
+          https://github.blog/changelog/2026-01-29-closing-down-notice-of-legacy-copilot-metrics-apis/
+        """
+        # Build the correct report endpoint for org vs enterprise
+        if self.api_type == "enterprises":
+            report_path = "enterprise-28-day"
+        else:
+            report_path = "organization-28-day"
+
+        url = (
+            f"https://api.github.com/{self.api_type}/{self.organization_slug}"
+            f"/copilot/metrics/reports/{report_path}/latest"
         )
-        for _team_slug, position_in_tree_and_url in urls.items():
-            position_in_tree, url = position_in_tree_and_url
-            data = github_api_request_handler(url, error_return_value={})
-            dict_save_to_json_file(
-                data,
-                f"{self.organization_slug}_{_team_slug}_copilot_metrics",
-                save_to_json=save_to_json,
-            )
-            data = convert_metrics_to_usage(data)
-            dict_save_to_json_file(
-                data,
-                f"{self.organization_slug}_{_team_slug}_copilot_usage",
-                save_to_json=save_to_json,
-            )
-            datas[_team_slug] = {
-                "position_in_tree": position_in_tree,
-                "copilot_usage_data": data,
+
+        logger.info(
+            f"Fetching Copilot metrics for {self.slug_type}: {self.organization_slug} "
+            f"via new report API — team-level breakdown not available in new API"
+        )
+
+        raw_data = self._fetch_report_data(
+            url, label=f"{self.organization_slug} {self.slug_type} metrics"
+        )
+
+        dict_save_to_json_file(
+            raw_data,
+            f"{self.organization_slug}_no-team_copilot_metrics",
+            save_to_json=save_to_json,
+        )
+
+        # Convert Metrics API format → Usage format consumed by DataSplitter
+        usage_data = convert_metrics_to_usage(raw_data)
+
+        dict_save_to_json_file(
+            usage_data,
+            f"{self.organization_slug}_no-team_copilot_usage",
+            save_to_json=save_to_json,
+        )
+
+        # Return in the same dict structure expected by the caller
+        datas = {
+            "no-team": {
+                "position_in_tree": "root_team",
+                "copilot_usage_data": usage_data,
             }
-            logger.info(f"Fetched Copilot usage for team: {_team_slug}")
+        }
 
-        if team_slug == "all":
-            dict_save_to_json_file(
-                datas,
-                f"{self.organization_slug}_all_teams_copilot_usage",
-                save_to_json=save_to_json,
-            )
+        dict_save_to_json_file(
+            datas,
+            f"{self.organization_slug}_all_teams_copilot_usage",
+            save_to_json=save_to_json,
+        )
 
+        logger.info(
+            f"Fetched {len(usage_data)} days of metrics for "
+            f"{self.slug_type}: {self.organization_slug}"
+        )
         return datas
 
     def get_seat_info_settings_standalone(self, save_to_json=True):
@@ -929,11 +997,19 @@ class GitHubOrganizationManager:
 
         return teams
 
-    def get_copilot_user_metrics(self, save_to_json=True):
+    def get_copilot_user_metrics(self, save_to_json=True, team_lookup=None):
         """
-        Fetch Copilot user metrics for the last 28 days from the Enterprise API
-        Uses the /copilot/metrics/reports/users-28-day/latest endpoint
-        The API returns download links which contain the actual user metrics JSON data
+        Fetch Copilot user metrics for the last 28 days.
+        Uses the /copilot/metrics/reports/users-28-day/latest endpoint.
+        The API returns signed download URLs containing NDJSON user-level data.
+
+        Args:
+            save_to_json: Whether to persist raw/processed data to JSON log files.
+            team_lookup: Optional dict mapping user_login -> team_slug, built from
+                         seat assignments. When provided, each user record is enriched
+                         with a `team_slug` field so Grafana team filters still work
+                         even though the new metrics API no longer provides team-level
+                         aggregates. Users not found in the lookup get 'no-team'.
         """
         # If a local metrics file is provided (for troubleshooting/demo), use it directly
         local_path = os.getenv("LOCAL_USER_METRICS_FILE")
@@ -956,6 +1032,14 @@ class GitHubOrganizationManager:
                         rec["slug_type"] = self.slug_type
                         rec["last_updated_at"] = current_time()
                         rec["utc_offset"] = self.utc_offset
+
+                        # Enrich with team info from seat assignments lookup
+                        user_login = rec.get("user_login", "")
+                        rec["team_slug"] = (
+                            team_lookup.get(user_login, "no-team")
+                            if team_lookup
+                            else "no-team"
+                        )
 
                         hash_properties = ["organization_slug", "user_login", "day"]
                         if "user_login" in rec and "day" in rec:
@@ -1099,6 +1183,15 @@ class GitHubOrganizationManager:
                         top_values = calculate_top_values(user_data)
                         
                         # Add organizational context and metadata
+                        # Enrich with team from seat assignments lookup so Grafana
+                        # team filters work even though the new metrics API returns
+                        # only org-level aggregates (no team breakdown).
+                        user_login = user_data.get('user_login', '')
+                        resolved_team = (
+                            team_lookup.get(user_login, 'no-team')
+                            if team_lookup
+                            else 'no-team'
+                        )
                         enriched_user_data = {
                             **user_data,
                             **top_values,  # Add calculated top values
@@ -1106,7 +1199,8 @@ class GitHubOrganizationManager:
                             'slug_type': self.slug_type,
                             'last_updated_at': current_time_str,
                             'utc_offset': self.utc_offset,
-                            'download_link_index': i
+                            'download_link_index': i,
+                            'team_slug': resolved_team,
                         }
                         
                         # Generate unique hash for deduplication (user + day combination)
@@ -1418,13 +1512,29 @@ def main(organization_slug):
             )
         logger.info(f"Data processing completed for {slug_type}: {organization_slug}")
 
+    # Build a user_login -> team_slug lookup from seat assignments so user metrics
+    # records can be enriched with team info (new metrics API has no team breakdown).
+    team_lookup = {}
+    if data_seat_assignments:
+        for seat in data_seat_assignments:
+            login = seat.get("assignee_login")
+            team = seat.get("assignee_team_slug", "no-team")
+            if login:
+                team_lookup[login] = team
+        logger.info(
+            f"Built team lookup with {len(team_lookup)} users across "
+            f"{len(set(team_lookup.values()))} teams for user metrics enrichment"
+        )
+
     # Process user metrics data
     logger.info(
         f"Processing Copilot user metrics for {slug_type}: {organization_slug}"
     )
     try:
         logger.info("Calling get_copilot_user_metrics()...")
-        user_metrics_data = github_org_manager.get_copilot_user_metrics()
+        user_metrics_data = github_org_manager.get_copilot_user_metrics(
+            team_lookup=team_lookup
+        )
         logger.info(f"get_copilot_user_metrics() returned: {type(user_metrics_data)} with {len(user_metrics_data) if user_metrics_data else 0} items")
         
         if not user_metrics_data:
