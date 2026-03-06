@@ -7,7 +7,10 @@ Complete setup guide for deploying GitHub Copilot Usage Advanced Dashboard on a 
 - Fresh Ubuntu 20.04/22.04/24.04 VM
 - SSH access to the VM
 - GitHub Personal Access Token (PAT) with scopes: `manage_billing:copilot`, `read:org`, `read:enterprise`
-- GitHub Organization with Copilot Business/Enterprise enabled
+- GitHub Organization or Enterprise with Copilot Business/Enterprise enabled
+
+> **Enterprise users:** Your `ORGANIZATION_SLUGS` must use the `standalone:<slug>` prefix.
+> For example, if your enterprise slug is `NegD`, set `ORGANIZATION_SLUGS=standalone:NegD`.
 
 ---
 
@@ -35,7 +38,11 @@ The script will:
 
 **Command-line flags** (skip interactive prompts):
 ```bash
+# For a GitHub Organization:
 ./setup.sh --pat ghp_YOUR_TOKEN --org your-org-name --interval 1 --tz America/New_York
+
+# For a GitHub Enterprise (use standalone: prefix):
+./setup.sh --pat ghp_YOUR_TOKEN --org standalone:your-enterprise-slug --interval 1 --tz America/New_York
 ```
 
 ---
@@ -101,7 +108,11 @@ nano .env
 
 **Environment Variables:**
 - `GITHUB_PAT`: Your GitHub Personal Access Token
-- `ORGANIZATION_SLUGS`: Your GitHub organization slug (single org or comma-separated: `org1,org2`)
+- `ORGANIZATION_SLUGS`: Your GitHub organization or enterprise slug:
+  - Single org: `myOrg`
+  - Multiple orgs: `myOrg1,myOrg2`
+  - **GitHub Enterprise slug** (most common for enterprise PATs): `standalone:your-enterprise-slug`
+    > Example: if your enterprise is `NegD`, set `ORGANIZATION_SLUGS=standalone:NegD`
 - `EXECUTION_INTERVAL_HOURS`: How often to fetch data (default: 1)
 - `ELASTICSEARCH_URL`: Keep as `http://elasticsearch:9200`
 
@@ -337,8 +348,19 @@ EXECUTION_INTERVAL_HOURS=6  # Fetch every 6 hours
 ### Monitor Multiple Organizations
 Edit `.env`:
 ```bash
+# Multiple orgs:
 ORGANIZATION_SLUGS=org1,org2,org3
+
+# Enterprise + org mixed:
+ORGANIZATION_SLUGS=standalone:your-enterprise,org2
 ```
+
+### GitHub Enterprise Setup
+If you have a GitHub Enterprise account (not just an org), your slug must use the `standalone:` prefix:
+```bash
+ORGANIZATION_SLUGS=standalone:your-enterprise-slug
+```
+This tells the fetcher to use the Enterprise API endpoints (`/enterprises/...`) instead of the org-level ones (`/orgs/...`). Your PAT must have `read:enterprise` scope.
 
 ### Increase Memory Limits
 Edit `docker-compose.yml`:
