@@ -1458,6 +1458,195 @@ class ElasticsearchManager:
             logger.info(f"[created] to [{index_name}]: {data}")
 
 
+def create_breakdown_from_user_metrics(user_metrics_data, organization_slug, es_manager):
+    """
+    Synthesize enterprise-level copilot_usage_breakdown, copilot_usage_breakdown_chat,
+    and per-team copilot_usage_total records by aggregating per-user metrics.
+
+    The new GitHub Enterprise report API does not return per-day/per-language/per-editor
+    aggregate breakdowns that the dashboard depends on.  This function reconstructs that
+    data from the individual user-level records that *are* available
+    (via /copilot/metrics/reports/users-28-day/latest), which contain:
+      - totals_by_language_model  → language + model per user per day
+      - totals_by_ide             → IDE/editor per user per day
+      - code_generation_activity_count, code_acceptance_activity_count, etc.
+
+    Populated indices:
+      - copilot_usage_breakdown      (Languages / Editors panels)
+      - copilot_usage_breakdown_chat (Chat-by-editor panel)
+      - copilot_usage_total          (Teams panels — one entry per team per day)
+    """
+    from collections import defaultdict
+
+    if not user_metrics_data:
+        logger.warning("[Enterprise Synthesis] No user metrics data available; skipping breakdown synthesis")
+        return
+
+    logger.info(
+        f"[Enterprise Synthesis] Aggregating {len(user_metrics_data)} user-day records "
+        f"into enterprise breakdown data for org: {organization_slug}"
+    )
+
+    # ── Language + Model breakdown ────────────────────────────────────────────
+    # Key: (day, language, model)
+    lang_model_agg = defaultdict(lambda: {
+        "suggestions_count": 0,
+        "acceptances_count": 0,
+        "lines_suggested": 0,
+        "lines_accepted": 0,
+        "active_users": 0,
+    })
+
+    # ── IDE / Editor breakdown ────────────────────────────────────────────────
+    # Key: (day, ide)
+    ide_agg = defaultdict(lambda: {
+        "chat_turns": 0,
+        "chat_copy_events": 0,
+        "chat_insertion_events": 0,
+        "chat_acceptances": 0,
+        "active_users": 0,
+    })
+
+    # ── Team usage total ──────────────────────────────────────────────────────
+    # Key: (day, team_slug)
+    team_agg = defaultdict(lambda: {
+        "total_suggestions_count": 0,
+        "total_acceptances_count": 0,
+        "total_lines_suggested": 0,
+        "total_lines_accepted": 0,
+        "total_active_users": 0,
+        "total_active_chat_users": 0,
+        "total_chat_turns": 0,
+        "total_chat_acceptances": 0,
+        "total_chat_copy_events": 0,
+        "total_chat_insertion_events": 0,
+    })
+
+    for user in user_metrics_data:
+        day = user.get("day")
+        if not day:
+            continue
+        team_slug = user.get("team_slug", "no-team")
+
+        # ── Language + Model aggregation ──────────────────────────────────────
+        for lm in user.get("totals_by_language_model", []):
+            language = lm.get("language", "unknown")
+            model = lm.get("model", "unknown")
+            key = (day, language, model)
+            agg = lang_model_agg[key]
+            code_count = lm.get("code_generation_activity_count", 0)
+            accept_count = lm.get("code_acceptance_activity_count", 0)
+            agg["suggestions_count"] += code_count
+            agg["acceptances_count"] += accept_count
+            agg["lines_suggested"] += lm.get("loc_suggested_to_add_sum", 0)
+            agg["lines_accepted"] += lm.get("loc_added_sum", 0)
+            if code_count > 0:
+                agg["active_users"] += 1
+
+        # ── IDE / Editor aggregation ──────────────────────────────────────────
+        for ide_entry in user.get("totals_by_ide", []):
+            ide_name = ide_entry.get("ide", "unknown")
+            key = (day, ide_name)
+            agg = ide_agg[key]
+            interaction_count = ide_entry.get("user_initiated_interaction_count", 0)
+            agg["chat_turns"] += interaction_count
+            agg["chat_acceptances"] += ide_entry.get("code_acceptance_activity_count", 0)
+            if interaction_count > 0:
+                agg["active_users"] += 1
+
+        # ── Team usage aggregation ────────────────────────────────────────────
+        key = (day, team_slug)
+        tagg = team_agg[key]
+        tagg["total_suggestions_count"] += user.get("code_generation_activity_count", 0)
+        tagg["total_acceptances_count"] += user.get("code_acceptance_activity_count", 0)
+        tagg["total_lines_suggested"] += user.get("loc_suggested_to_add_sum", 0)
+        tagg["total_lines_accepted"] += user.get("loc_added_sum", 0)
+        tagg["total_chat_turns"] += user.get("user_initiated_interaction_count", 0)
+        if (user.get("code_generation_activity_count", 0) > 0
+                or user.get("user_initiated_interaction_count", 0) > 0):
+            tagg["total_active_users"] += 1
+        if user.get("used_chat", False):
+            tagg["total_active_chat_users"] += 1
+
+    logger.info(
+        f"[Enterprise Synthesis] Grouped into "
+        f"{len(lang_model_agg)} language+model+day, "
+        f"{len(ide_agg)} ide+day, "
+        f"{len(team_agg)} team+day combinations"
+    )
+
+    # ── Write copilot_usage_breakdown (Languages panel) ───────────────────────
+    breakdown_written = 0
+    for (day, language, model), stats in lang_model_agg.items():
+        entry = {
+            "day": day,
+            "language": language,
+            "model": model,
+            "editor": "enterprise-aggregate",
+            "suggestions_count": stats["suggestions_count"],
+            "acceptances_count": stats["acceptances_count"],
+            "lines_suggested": stats["lines_suggested"],
+            "lines_accepted": stats["lines_accepted"],
+            "active_users": stats["active_users"],
+            "organization_slug": organization_slug,
+            "team_slug": "no-team",
+            "position_in_tree": "root_team",
+        }
+        entry["unique_hash"] = generate_unique_hash(
+            entry,
+            key_properties=["organization_slug", "team_slug", "day", "language", "editor", "model"],
+        )
+        es_manager.write_to_es(Indexes.index_name_breakdown, entry)
+        breakdown_written += 1
+    logger.info(f"[Enterprise Synthesis] Wrote {breakdown_written} language/model breakdown entries")
+
+    # ── Write copilot_usage_breakdown_chat (Editor/Chat panel) ────────────────
+    chat_written = 0
+    for (day, ide_name), stats in ide_agg.items():
+        entry = {
+            "day": day,
+            "editor": ide_name,
+            "model": "enterprise-aggregate",
+            "chat_turns": stats["chat_turns"],
+            "chat_copy_events": stats["chat_copy_events"],
+            "chat_insertion_events": stats["chat_insertion_events"],
+            "chat_acceptances": stats["chat_acceptances"],
+            "active_users": stats["active_users"],
+            "organization_slug": organization_slug,
+            "team_slug": "no-team",
+            "position_in_tree": "root_team",
+        }
+        entry["unique_hash"] = generate_unique_hash(
+            entry,
+            key_properties=["organization_slug", "team_slug", "day", "editor", "model"],
+        )
+        es_manager.write_to_es(Indexes.index_name_breakdown_chat, entry)
+        chat_written += 1
+    logger.info(f"[Enterprise Synthesis] Wrote {chat_written} editor/chat breakdown entries")
+
+    # ── Write per-team copilot_usage_total (Teams panels) ────────────────────
+    teams_found = {ts for (_, ts) in team_agg.keys()}
+    team_written = 0
+    for (day, team_slug), stats in team_agg.items():
+        entry = {
+            "day": day,
+            "team_slug": team_slug,
+            "position_in_tree": "leaf_team",
+            "organization_slug": organization_slug,
+            **stats,
+        }
+        entry["unique_hash"] = generate_unique_hash(
+            entry,
+            key_properties=["organization_slug", "team_slug", "day"],
+        )
+        es_manager.write_to_es(Indexes.index_name_total, entry)
+        team_written += 1
+    logger.info(
+        f"[Enterprise Synthesis] Wrote {team_written} team-level usage_total entries "
+        f"across {len(teams_found)} team(s): {sorted(teams_found)}"
+    )
+
+
 def main(organization_slug):
     logger.info(
         "=========================================================================================================="
@@ -1530,6 +1719,7 @@ def main(organization_slug):
     logger.info(
         f"Processing Copilot user metrics for {slug_type}: {organization_slug}"
     )
+    user_metrics_data = []  # initialised here so it is visible after the try block
     try:
         logger.info("Calling get_copilot_user_metrics()...")
         user_metrics_data = github_org_manager.get_copilot_user_metrics(
@@ -1561,6 +1751,19 @@ def main(organization_slug):
         logger.error(f"Failed to process user metrics for {slug_type} {organization_slug}: {e}")
         import traceback
         logger.error(f"Full traceback: {traceback.format_exc()}")
+
+    # For enterprise/standalone mode: synthesise breakdown, breakdown_chat, and
+    # per-team usage_total from per-user metrics so the Languages, Editors, and
+    # Teams panels in Grafana are populated (the enterprise report API does not
+    # provide these aggregates directly).
+    if is_standalone and user_metrics_data:
+        try:
+            create_breakdown_from_user_metrics(
+                user_metrics_data, organization_slug, es_manager
+            )
+        except Exception as e:
+            logger.error(f"Failed to synthesise enterprise breakdown data: {e}")
+            logger.error(f"Full traceback: {traceback.format_exc()}")
 
     # Create user summaries with aggregated top_model/language/feature
     try:
