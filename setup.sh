@@ -30,8 +30,10 @@ while [[ $# -gt 0 ]]; do
     --help|-h)
       echo "Usage: $0 [--pat <token>] [--org <slug>] [--interval <hours>] [--tz <tz>]"
       echo ""
-      echo "  --pat       GitHub Personal Access Token (manage_billing:copilot, read:org)"
-      echo "  --org       GitHub Org slug(s), comma-separated. Use 'standalone:slug' for Copilot Standalone"
+      echo "  --pat       GitHub Personal Access Token (manage_billing:copilot, read:org, read:enterprise)"
+      echo "  --org       GitHub Org slug(s), comma-separated."
+      echo "              Use 'standalone:<slug>' for Enterprise or Copilot Standalone slugs."
+      echo "              e.g. --org standalone:NegD  OR  --org myOrg1,myOrg2"
       echo "  --interval  Data fetch interval in hours (default: 1)"
       echo "  --tz        Timezone, e.g. America/New_York (default: GMT)"
       exit 0 ;;
@@ -165,11 +167,14 @@ success "GitHub PAT: ${GITHUB_PAT:0:8}…(hidden)"
 # ORGANIZATION_SLUGS
 if [[ -z "${ORGANIZATION_SLUGS:-}" ]]; then
   echo ""
-  echo -e "  ${BOLD}GitHub Organization Slug(s)${RESET}"
+  echo -e "  ${BOLD}GitHub Organization / Enterprise Slug(s)${RESET}"
   echo -e "  Examples:"
-  echo -e "    Single org:        ${YELLOW}myOrg${RESET}"
-  echo -e "    Multiple orgs:     ${YELLOW}myOrg1,myOrg2${RESET}"
-  echo -e "    Copilot Standalone:${YELLOW}standalone:mySlug${RESET}"
+  echo -e "    Single org:              ${YELLOW}myOrg${RESET}"
+  echo -e "    Multiple orgs:           ${YELLOW}myOrg1,myOrg2${RESET}"
+  echo -e "    Enterprise slug:         ${YELLOW}standalone:myEnterprise${RESET}"
+  echo -e "    Copilot Standalone:      ${YELLOW}standalone:mySlug${RESET}"
+  echo -e "  ${CYAN}Tip:${RESET} Use the 'standalone:' prefix for GitHub Enterprise slugs"
+  echo -e "       (e.g. if your enterprise is 'NegD', enter: standalone:NegD)"
   echo ""
   read -rp "  Enter org slug(s): " ORGANIZATION_SLUGS
   [[ -z "$ORGANIZATION_SLUGS" ]] && error "ORGANIZATION_SLUGS cannot be empty."
