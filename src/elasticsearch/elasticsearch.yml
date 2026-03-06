@@ -1,4 +1,4 @@
-bootstrap.memory_lock: true
+bootstrap.memory_lock: false
 cluster.name: es-docker-cluster
 discovery.type: single-node
 network.host: 0.0.0.0

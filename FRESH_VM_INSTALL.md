@@ -1,417 +1,502 @@
-# Fresh Linux VM Installation Guide
+# Copilot Usage Advanced Dashboard — Standalone Enterprise VM Deployment Guide
 
-Complete setup guide for deploying GitHub Copilot Usage Advanced Dashboard on a fresh Linux VM.
-
-## Prerequisites
-
-- Fresh Ubuntu 20.04/22.04/24.04 VM
-- SSH access to the VM
-- GitHub Personal Access Token (PAT) with scopes: `manage_billing:copilot`, `read:org`, `read:enterprise`
-- GitHub Organization or Enterprise with Copilot Business/Enterprise enabled
-
-> **Enterprise users:** Your `ORGANIZATION_SLUGS` must use the `standalone:<slug>` prefix.
-> For example, if your enterprise slug is `NegD`, set `ORGANIZATION_SLUGS=standalone:NegD`.
+This guide covers deploying the Copilot Usage Advanced Dashboard on a Linux VM for **Standalone (Enterprise)** Copilot setups where you only have an enterprise slug (no individual organization).
 
 ---
 
-## Quick Start (Automated)
+## Quick Install (One Command)
 
-### Option 1: One-Click Setup Script
+SSH into your VM and run:
 
 ```bash
-# Clone repository
-git clone https://github.com/AkashAi7/copilot-usage-advanced-dashboard.git
-cd copilot-usage-advanced-dashboard
+curl -sL https://raw.githubusercontent.com/AkashAi7/copilot-usage-advanced-dashboard/main/scripts/install.sh | bash
+```
 
-# Make script executable and run
-chmod +x setup.sh
-./setup.sh
+Or if you already cloned the repo:
+
+```bash
+cd ~/copilot-usage-advanced-dashboard
+GITHUB_PAT=ghp_your_token ORGANIZATION_SLUGS=standalone:your-enterprise-slug bash scripts/install.sh
 ```
 
 The script will:
-- ✅ Check and install prerequisites (Docker, Docker Compose)
-- ✅ Collect GitHub credentials interactively
-- ✅ Generate `.env` configuration
-- ✅ Build and start all containers
-- ✅ Perform health checks
-- ✅ Display access URLs with local and public IPs
+- Install Docker and dependencies
+- Configure kernel settings
+- Write a production-ready `docker-compose.yml` (Grafana on port **3000**)
+- Start all containers and wait for data collection
+- Verify all 7 indexes are populated
+- Print the Grafana URL with credentials
 
-**Command-line flags** (skip interactive prompts):
-```bash
-# For a GitHub Organization:
-./setup.sh --pat ghp_YOUR_TOKEN --org your-org-name --interval 1 --tz America/New_York
+If you prefer manual setup, follow the steps below.
 
-# For a GitHub Enterprise (use standalone: prefix):
-./setup.sh --pat ghp_YOUR_TOKEN --org standalone:your-enterprise-slug --interval 1 --tz America/New_York
+---
+
+## Table of Contents
+
+- [Prerequisites](#prerequisites)
+- [Architecture](#architecture)
+- [Step 1 — Provision a Linux VM](#step-1--provision-a-linux-vm)
+- [Step 2 — SSH into the VM](#step-2--ssh-into-the-vm)
+- [Step 3 — Install Docker](#step-3--install-docker)
+- [Step 4 — Configure Kernel Settings](#step-4--configure-kernel-settings)
+- [Step 5 — Clone the Repository](#step-5--clone-the-repository)
+- [Step 6 — Create the .env File](#step-6--create-the-env-file)
+- [Step 7 — Create Dashboard Placeholder](#step-7--create-dashboard-placeholder)
+- [Step 8 — Open Firewall Port](#step-8--open-firewall-port)
+- [Step 9 — Start the Stack](#step-9--start-the-stack)
+- [Step 10 — Verify the Run](#step-10--verify-the-run)
+- [Step 11 — Verify Elasticsearch Indexes](#step-11--verify-elasticsearch-indexes)
+- [Step 12 — Access Grafana](#step-12--access-grafana)
+- [Networking — Azure NSG Configuration](#networking--azure-nsg-configuration)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## Prerequisites
+
+| Requirement | Details |
+|---|---|
+| **VM** | Ubuntu 22.04+ recommended, 16 GB RAM, 2+ vCPUs |
+| **GitHub PAT** | Personal Access Token with `manage_billing:copilot`, `read:enterprise`, `read:org` scopes. [Create Token](https://github.com/settings/tokens) |
+| **Enterprise Slug** | Your GitHub Enterprise slug (from `github.com/enterprises/<slug>`) |
+| **Ports** | `3000` (Grafana) and `22` (SSH) must be open |
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                     Linux VM                        │
+│                                                     │
+│  ┌──────────────┐  ┌──────────┐  ┌──────────────┐  │
+│  │Elasticsearch │  │  Grafana  │  │cpuad-updater │  │
+│  │  :9200       │  │  :3000   │  │  (hourly)    │  │
+│  └──────┬───────┘  └────┬─────┘  └──────┬───────┘  │
+│         │               │               │          │
+│         └───────────────┴───────────────┘          │
+│              Docker Compose Network                 │
+└─────────────────────────────────────────────────────┘
+         │                                    │
+         │ Read data                          │ Fetch data
+         ▼                                    ▼
+    Grafana Dashboard              GitHub Enterprise API
 ```
 
 ---
 
-## Manual Installation (Step-by-Step)
+## Step 1 — Provision a Linux VM
 
-If you prefer manual control or the automated script fails:
+Create a VM in your cloud provider:
 
-### Step 1: Update System
+- **Azure**: Create a Standard_D2s_v3 (2 vCPU, 8 GB) or Standard_D4s_v3 (4 vCPU, 16 GB)
+- **AWS**: t3.large or t3.xlarge
+- **GCP**: e2-standard-2 or e2-standard-4
+
+> Minimum 8 GB RAM is required. 16 GB is recommended.
+
+---
+
+## Step 2 — SSH into the VM
+
 ```bash
-sudo apt update && sudo apt upgrade -y
+ssh your-user@<VM_PUBLIC_IP>
 ```
 
-### Step 2: Install Docker
-```bash
-# Install Docker
-sudo apt install -y docker.io
+---
 
-# Add current user to docker group
+## Step 3 — Install Docker
+
+```bash
+sudo apt update && sudo apt install -y docker.io docker-compose-v2 git jq
+sudo systemctl enable docker && sudo systemctl start docker
+```
+
+Add your user to the docker group (avoids needing `sudo` for every docker command):
+
+```bash
 sudo usermod -aG docker $USER
-
-# Log out and log back in to apply group changes
-exit
-# SSH back in
+newgrp docker
 ```
 
-### Step 3: Install Docker Compose
+Verify:
+
 ```bash
-# Download Docker Compose v2
-sudo curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose
-
-# Make executable
-sudo chmod +x /usr/local/bin/docker-compose
-
-# Create plugin directory and symlink
-sudo mkdir -p /usr/local/lib/docker/cli-plugins
-sudo ln -sf /usr/local/bin/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
-
-# Verify installation
-docker compose version
+docker version
 ```
 
-### Step 4: Clone Repository
+---
+
+## Step 4 — Configure Kernel Settings
+
+Elasticsearch requires `vm.max_map_count` to be at least 262144:
+
+```bash
+sudo sysctl -w vm.max_map_count=262144
+echo "vm.max_map_count=262144" | sudo tee -a /etc/sysctl.conf
+```
+
+---
+
+## Step 5 — Clone the Repository
+
 ```bash
 cd ~
 git clone https://github.com/AkashAi7/copilot-usage-advanced-dashboard.git
 cd copilot-usage-advanced-dashboard
 ```
 
-### Step 5: Configure Environment
+---
+
+## Step 6 — Create the .env File
+
 ```bash
-# Create .env file
-cat > .env << 'EOF'
-GITHUB_PAT=ghp_YOUR_GITHUB_PAT_HERE
-ORGANIZATION_SLUGS=your-organization-name
+cat > .env <<EOF
+GITHUB_PAT=ghp_your_token_here
+ORGANIZATION_SLUGS=standalone:your-enterprise-slug
 EXECUTION_INTERVAL_HOURS=1
-ELASTICSEARCH_URL=http://elasticsearch:9200
 EOF
-
-# Replace with your actual values
-nano .env
 ```
 
-**Environment Variables:**
-- `GITHUB_PAT`: Your GitHub Personal Access Token
-- `ORGANIZATION_SLUGS`: Your GitHub organization or enterprise slug:
-  - Single org: `myOrg`
-  - Multiple orgs: `myOrg1,myOrg2`
-  - **GitHub Enterprise slug** (most common for enterprise PATs): `standalone:your-enterprise-slug`
-    > Example: if your enterprise is `NegD`, set `ORGANIZATION_SLUGS=standalone:NegD`
-- `EXECUTION_INTERVAL_HOURS`: How often to fetch data (default: 1)
-- `ELASTICSEARCH_URL`: Keep as `http://elasticsearch:9200`
+**Important:**
+- Replace `ghp_your_token_here` with your actual GitHub Personal Access Token
+- Replace `your-enterprise-slug` with your actual enterprise slug (e.g., `NegD`)
+- The `standalone:` prefix is **required** — it tells the app to use Enterprise APIs instead of Organization APIs
 
-### Step 6: Create Dashboard Placeholder
+### Slug Format Reference
+
+| Format | Description |
+|---|---|
+| `myOrg1` | Single organization |
+| `myOrg1,myOrg2` | Multiple organizations |
+| `standalone:myEnterprise` | Enterprise-only (standalone) |
+| `myOrg1,standalone:myEnterprise` | Mixed org + enterprise |
+
+---
+
+## Step 7 — Create Dashboard Placeholder
+
+Docker Compose mounts `user_advance_metrics_dashboard.json`. If the file is missing, Docker creates it as a directory which breaks Grafana:
+
 ```bash
-# Create empty JSON file to prevent Docker volume bug
-echo '{}' > user_advance_metrics_dashboard.json
+[ -f user_advance_metrics_dashboard.json ] || echo '{}' > user_advance_metrics_dashboard.json
 ```
 
-### Step 7: Start Services
-```bash
-# Build and start containers
-docker compose up --build -d
+Also ensure the provisioning directory exists:
 
-# Check container status
-docker compose ps
+```bash
+mkdir -p grafana-provisioning/dashboards
+```
+
+---
+
+## Step 8 — Open Firewall Port
+
+```bash
+# Linux firewall (if ufw is active)
+sudo ufw allow 3000/tcp 2>/dev/null; true
+```
+
+For cloud provider firewall, see [Networking — Azure NSG Configuration](#networking--azure-nsg-configuration) below.
+
+---
+
+## Step 9 — Start the Stack
+
+```bash
+docker compose up -d --build
 ```
 
 Expected output:
+
 ```
-NAME            STATUS          PORTS
-elasticsearch   Up (health: starting)   0.0.0.0:9200->9200/tcp
-grafana         Up (healthy)            0.0.0.0:3000->80/tcp
-cpuad-updater   Up (health: starting)
-init-grafana    Started
+✔ Container elasticsearch  Healthy    61.5s
+✔ Container cpuad-updater  Started    61.6s
+✔ Container grafana        Started     0.6s
+✔ Container init-grafana   Started     0.3s
 ```
 
-### Step 8: Configure Azure NSG/Firewall
+> Note: Elasticsearch takes ~60 seconds to become healthy. The `cpuad-updater` will wait automatically.
 
-**Azure Portal:**
-1. Go to your VM → Networking → Network settings
-2. Add inbound security rule:
-   - **Port:** 3000
-   - **Protocol:** TCP
-   - **Source:** Any (or your IP for security)
-   - **Action:** Allow
-   - **Priority:** 1000
-   - **Name:** Allow-Grafana-3000
+---
 
-**Azure CLI:**
+## Step 10 — Verify the Run
+
+Watch the updater logs:
+
+```bash
+docker logs -f cpuad-updater
+```
+
+Wait for the full sequence:
+
+```
+Elasticsearch is up and running
+Created index: copilot_seat_info_settings
+Created index: copilot_seat_assignments
+Created index: copilot_usage_total
+Created index: copilot_usage_breakdown
+Created index: copilot_usage_breakdown_chat
+Created index: copilot_user_metrics
+Created index: copilot_user_adoption
+Processing Copilot seat info & settings for Standalone: ...
+Processing Copilot seat assignments for Standalone: ...
+Processing Copilot user metrics for Standalone: ...
+Processing Copilot usage data for Standalone: ...
+-----------------Finished Successfully-----------------
+Sleeping for 1 hour(s) until next run...
+```
+
+Press `Ctrl+C` to exit the log view.
+
+---
+
+## Step 11 — Verify Elasticsearch Indexes
+
+```bash
+for idx in copilot_seat_info_settings copilot_seat_assignments copilot_usage_total copilot_usage_breakdown copilot_usage_breakdown_chat copilot_user_metrics copilot_user_adoption; do
+  echo -n "$idx: "; curl -s http://localhost:9200/$idx/_count | jq .count
+done
+```
+
+Expected output (all non-zero):
+
+```
+copilot_seat_info_settings: 1
+copilot_seat_assignments: 394
+copilot_usage_total: 2008
+copilot_usage_breakdown: 10550
+copilot_usage_breakdown_chat: 2148
+copilot_user_metrics: 3360
+copilot_user_adoption: 11
+```
+
+---
+
+## Step 12 — Access Grafana
+
+Open in your browser:
+
+```
+http://<VM_PUBLIC_IP>:3000
+```
+
+| Field | Value |
+|---|---|
+| **Username** | `admin` |
+| **Password** | `copilot` |
+
+### Dashboard Panels
+
+Set the time range to **Last 90 days** or **Last 6 months** to see full history.
+
+| Panel Section | Data Source Index | What It Shows |
+|---|---|---|
+| **Organization** | `copilot_usage_total` | Acceptance rate, suggestions, lines of code |
+| **Teams** | `copilot_usage_breakdown` | Team-level comparisons |
+| **Languages** | `copilot_usage_breakdown` | Language-level usage stats |
+| **Editors** | `copilot_usage_breakdown` | Editor-level usage stats |
+| **Copilot Chat** | `copilot_usage_breakdown_chat` | Chat turns, acceptances, active users |
+| **Seat Analysis** | `copilot_seat_info_settings` + `copilot_seat_assignments` | Seat allocation, inactive users |
+| **Breakdown Heatmap** | `copilot_usage_breakdown` | Language × Editor matrix |
+| **User Metrics** | `copilot_user_metrics` + `copilot_user_adoption` | Per-user analytics, Top 10 leaderboard |
+
+---
+
+## Networking — Azure NSG Configuration
+
+If your VM is on Azure, you need an inbound NSG rule for port 3000.
+
+### Check for two NSGs
+
+Azure VMs can have NSGs at **two levels** — both must allow port 3000:
+
+1. **Subnet-level NSG**: Azure Portal → VM → Networking → look at the subnet's NSG
+2. **NIC-level NSG**: Azure Portal → VM → Networking → click the Network Interface → Network security group
+
+### Add the rule
+
+In each NSG that exists:
+
+- **Source**: Any (or your IP for security)
+- **Destination port**: 3000
+- **Protocol**: TCP
+- **Action**: Allow
+- **Priority**: 1001 (or any number < 65000)
+
+### Azure CLI
+
 ```bash
 az network nsg rule create \
   --resource-group YOUR_RG \
   --nsg-name YOUR_NSG \
   --name Allow-Grafana-3000 \
-  --priority 1000 \
+  --priority 1001 \
   --destination-port-ranges 3000 \
   --access Allow \
   --protocol Tcp
 ```
 
-**UFW (VM firewall):**
+### Verify from the VM
+
 ```bash
-sudo ufw allow 3000/tcp
-sudo ufw status
+PUBLIC_IP=$(curl -s ifconfig.me)
+echo "Public IP: $PUBLIC_IP"
+curl -m 5 http://$PUBLIC_IP:3000/api/health
 ```
 
-### Step 9: Access Dashboard
-
-Get your public IP:
-```bash
-curl -s https://api.ipify.org
-```
-
-Open browser:
-- **URL:** `http://YOUR_PUBLIC_IP:3000`
-- **Username:** `admin`
-- **Password:** `copilot`
-
----
-
-## Verification & Monitoring
-
-### Check Container Health
-```bash
-docker compose ps
-```
-
-### Monitor Data Fetching
-```bash
-# Watch live logs
-docker compose logs -f cpuad-updater
-
-# Look for messages like:
-# [INFO] Fetched Copilot usage for org: your-org-name
-# [INFO] Successfully indexed data to Elasticsearch
-```
-
-### Force Immediate Data Fetch
-```bash
-docker compose restart cpuad-updater
-docker compose logs -f cpuad-updater
-```
-
-### Check Elasticsearch Health
-```bash
-curl http://localhost:9200/_cluster/health?pretty
-```
-
-### Check Individual Container Logs
-```bash
-docker compose logs grafana
-docker compose logs elasticsearch
-docker compose logs init-grafana
-```
+If `localhost` works but the public IP doesn't → NSG is blocking.
 
 ---
 
 ## Troubleshooting
 
-### Issue: Elasticsearch Not Healthy / Timeout
-The most common cause on a fresh Linux VM is the missing kernel setting:
+### Elasticsearch exits with code 137 (OOM)
+
 ```bash
-# Check current value (needs to be at least 262144)
-cat /proc/sys/vm/max_map_count
+# Check memory
+free -h
 
-# Fix (required by Elasticsearch)
-sudo sysctl -w vm.max_map_count=262144
+# Ensure memory lock is disabled in elasticsearch.yml
+grep memory_lock src/elasticsearch/elasticsearch.yml
+# Must show: bootstrap.memory_lock: false
 
-# Make it persist across reboots
-echo 'vm.max_map_count=262144' | sudo tee -a /etc/sysctl.conf
+# Increase container memory limit in docker-compose.yml
+# mem_limit: 2g (minimum for ES)
+```
 
-# Then restart the containers
+### Elasticsearch 503 — No shard available
+
+Existing indexes were created with replicas. Fix:
+
+```bash
+for index in copilot_seat_info_settings copilot_seat_assignments copilot_usage_total copilot_usage_breakdown copilot_usage_breakdown_chat copilot_user_metrics copilot_user_adoption; do
+  curl -X PUT http://localhost:9200/$index/_settings \
+    -H "Content-Type: application/json" \
+    -d '{"index":{"number_of_replicas":0}}'
+done
+```
+
+Or nuclear option — delete all data and start fresh:
+
+```bash
 docker compose down
-docker compose up -d
+docker volume rm copilot-usage-advanced-dashboard_data copilot-usage-advanced-dashboard_logs
+docker compose up -d --build
 ```
 
-### Issue: Permission Denied Errors
+### cpuad-updater can't resolve `elasticsearch`
+
 ```bash
-sudo chown -R $USER:$USER ~/copilot-usage-advanced-dashboard
+# Full restart to recreate Docker network
+docker compose down && docker compose up -d --build
 ```
 
-### Issue: Port Already in Use
+### Grafana reachable on localhost but not public IP
+
 ```bash
-# Check what's using port 3000 or 9200
-sudo ss -tlnp | grep 3000
-sudo ss -tlnp | grep 9200
+# Verify port is listening
+ss -tlnp | grep 3000
 
-# Stop conflicting containers
-docker compose down
-docker rm -f $(docker ps -aq)
-
-# Restart Docker if needed
-sudo systemctl restart docker
+# Check cloud firewall (Azure NSG / AWS Security Group / GCP Firewall)
+# Both subnet-level AND NIC-level NSGs must allow port 3000
 ```
 
-### Issue: Container Keeps Restarting
+### Force a fresh data fetch (don't wait 1 hour)
+
 ```bash
-# Check logs for errors
-docker compose logs [container-name]
-
-# Common fixes:
-# 1. Verify .env has correct GITHUB_PAT
-# 2. Check ORGANIZATION_SLUGS spelling
-# 3. Ensure PAT has correct scopes
+docker restart cpuad-updater && docker logs -f cpuad-updater
 ```
 
-### Issue: No Data in Dashboard
-1. Wait for first fetch cycle (EXECUTION_INTERVAL_HOURS)
-2. Check cpuad-updater logs for errors
+### Validate GitHub API access
+
+```bash
+# Check teams
+curl -s -H "Authorization: Bearer YOUR_PAT" -H "Accept: application/vnd.github+json" \
+  https://api.github.com/enterprises/YOUR_SLUG/teams | jq '.[].slug'
+
+# Check metrics
+curl -s -H "Authorization: Bearer YOUR_PAT" -H "Accept: application/vnd.github+json" \
+  "https://api.github.com/enterprises/YOUR_SLUG/copilot/metrics" | jq '.[0].date'
+```
+
+### No Data in Dashboard
+1. Wait for first fetch cycle (check `EXECUTION_INTERVAL_HOURS` in `.env`)
+2. Check cpuad-updater logs: `docker logs cpuad-updater`
 3. Verify organization has Copilot seats assigned
-4. Check GitHub PAT has `manage_billing:copilot` scope
+4. Verify PAT has `manage_billing:copilot` + `read:enterprise` scopes
+5. Set Grafana time range to **Last 90 days** or wider
 
-### Issue: Grafana Login Loop
+### Grafana Login Loop
 ```bash
-# Reset Grafana admin password
 docker compose exec grafana grafana-cli admin reset-admin-password copilot
+```
+
+---
+
+## Summary of All Commands (Quick Reference)
+
+```bash
+# 1. SSH
+ssh user@<VM_IP>
+
+# 2. Install
+sudo apt update && sudo apt install -y docker.io docker-compose-v2 git jq
+sudo systemctl enable docker && sudo systemctl start docker
+sudo usermod -aG docker $USER && newgrp docker
+
+# 3. Kernel
+sudo sysctl -w vm.max_map_count=262144
+echo "vm.max_map_count=262144" | sudo tee -a /etc/sysctl.conf
+
+# 4. Clone
+cd ~ && git clone https://github.com/AkashAi7/copilot-usage-advanced-dashboard.git
+cd copilot-usage-advanced-dashboard
+
+# 5. Configure
+cat > .env <<EOF
+GITHUB_PAT=ghp_your_token
+ORGANIZATION_SLUGS=standalone:your-enterprise-slug
+EXECUTION_INTERVAL_HOURS=1
+EOF
+
+# 6. Placeholder
+[ -f user_advance_metrics_dashboard.json ] || echo '{}' > user_advance_metrics_dashboard.json
+
+# 7. Start
+docker compose up -d --build
+
+# 8. Watch
+docker logs -f cpuad-updater
+
+# 9. Verify
+for idx in copilot_seat_info_settings copilot_seat_assignments copilot_usage_total copilot_usage_breakdown copilot_usage_breakdown_chat copilot_user_metrics copilot_user_adoption; do
+  echo -n "$idx: "; curl -s http://localhost:9200/$idx/_count | jq .count
+done
+
+# 10. Open browser: http://<VM_IP>:3000 (admin/copilot)
 ```
 
 ---
 
 ## Management Commands
 
-### Stop Services
-```bash
-docker compose down
-```
-
-### Restart Services
-```bash
-docker compose restart
-```
-
-### View All Logs
-```bash
-docker compose logs
-```
-
-### Reset Everything (Delete All Data)
-```bash
-docker compose down -v
-```
-
-### Update to Latest Version
-```bash
-git pull origin main
-docker compose up --build -d
-```
-
----
-
-## Architecture
-
-**Services:**
-- **Elasticsearch** (port 9200): Data storage
-- **Grafana** (port 3000): Dashboard UI
-- **cpuad-updater**: Fetches GitHub Copilot metrics every N hours
-- **init-grafana**: One-time setup for Grafana data sources
-
-**Data Flow:**
-1. `cpuad-updater` fetches metrics from GitHub Copilot API
-2. Data is indexed into Elasticsearch
-3. Grafana queries Elasticsearch and displays dashboards
-4. Process repeats every `EXECUTION_INTERVAL_HOURS`
-
-**Volumes:**
-- `data`: Elasticsearch data (persistent)
-- `logs`: Elasticsearch logs
-- `grafana`: Grafana configuration and dashboards
+| Action | Command |
+|--------|---------|
+| Stop services | `docker compose down` |
+| Restart services | `docker compose restart` |
+| View all logs | `docker compose logs` |
+| Reset everything | `docker compose down -v` |
+| Update to latest | `git pull origin main && docker compose up --build -d` |
+| Force data fetch | `docker restart cpuad-updater && docker logs -f cpuad-updater` |
 
 ---
 
 ## Security Best Practices
 
-1. **Never commit `.env` file** - Contains sensitive tokens
-2. **Restrict NSG rules** - Allow only your IP, not `0.0.0.0/0`
-3. **Change default Grafana password** - Edit `docker-compose.yml` before first run
-4. **Rotate GitHub PAT regularly** - Create new tokens periodically
-5. **Use HTTPS** - Set up reverse proxy (nginx/Caddy) with SSL certificate
-6. **Keep updated** - Run `git pull` and rebuild containers regularly
-
----
-
-## Advanced Configuration
-
-### Change Grafana Port
-Edit `docker-compose.yml`:
-```yaml
-grafana:
-  ports:
-    - "3000:80"  # Change 3000 to your desired port
-```
-
-### Run on Different Schedule
-Edit `.env`:
-```bash
-EXECUTION_INTERVAL_HOURS=6  # Fetch every 6 hours
-```
-
-### Monitor Multiple Organizations
-Edit `.env`:
-```bash
-# Multiple orgs:
-ORGANIZATION_SLUGS=org1,org2,org3
-
-# Enterprise + org mixed:
-ORGANIZATION_SLUGS=standalone:your-enterprise,org2
-```
-
-### GitHub Enterprise Setup
-If you have a GitHub Enterprise account (not just an org), your slug must use the `standalone:` prefix:
-```bash
-ORGANIZATION_SLUGS=standalone:your-enterprise-slug
-```
-This tells the fetcher to use the Enterprise API endpoints (`/enterprises/...`) instead of the org-level ones (`/orgs/...`). Your PAT must have `read:enterprise` scope.
-
-### Increase Memory Limits
-Edit `docker-compose.yml`:
-```yaml
-elasticsearch:
-  mem_limit: 2g  # Increase from 1g
-  cpus: 2        # Increase from 1
-```
-
----
-
-## Getting Help
-
-- **GitHub Issues:** https://github.com/AkashAi7/copilot-usage-advanced-dashboard/issues
-- **Original Project:** https://github.com/satomic/copilot-usage-advanced-dashboard
-- **Docker Docs:** https://docs.docker.com/
-- **Grafana Docs:** https://grafana.com/docs/
-
----
-
-## Quick Reference
-
-| Component | Port | Credentials | Endpoint |
-|-----------|------|-------------|----------|
-| Grafana | 3000 | admin / copilot | http://YOUR_IP:3000 |
-| Elasticsearch | 9200 | None | http://YOUR_IP:9200 |
-
-**Useful URLs:**
-- Grafana Login: `http://YOUR_IP:3000/login`
-- Elasticsearch Health: `http://YOUR_IP:9200/_cluster/health`
-- Elasticsearch Indices: `http://YOUR_IP:9200/_cat/indices?v`
-
----
-
-## License
-
-See [LICENSE](LICENSE) file for details.
+1. **Never commit `.env` file** — Contains sensitive tokens
+2. **Restrict NSG rules** — Allow only your IP, not `0.0.0.0/0`
+3. **Change default Grafana password** — Edit `docker-compose.yml` before first run
+4. **Rotate GitHub PAT regularly** — Create new tokens periodically
+5. **Use HTTPS** — Set up reverse proxy (nginx/Caddy) with SSL certificate
+6. **Keep updated** — Run `git pull` and rebuild containers regularly
