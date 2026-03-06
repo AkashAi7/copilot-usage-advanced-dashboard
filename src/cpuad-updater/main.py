@@ -1529,19 +1529,42 @@ def create_breakdown_from_user_metrics(user_metrics_data, organization_slug, es_
         team_slug = user.get("team_slug", "no-team")
 
         # ── Language + Model aggregation ──────────────────────────────────────
-        for lm in user.get("totals_by_language_model", []):
-            language = lm.get("language", "unknown")
-            model = lm.get("model", "unknown")
-            key = (day, language, model)
-            agg = lang_model_agg[key]
-            code_count = lm.get("code_generation_activity_count", 0)
-            accept_count = lm.get("code_acceptance_activity_count", 0)
-            agg["suggestions_count"] += code_count
-            agg["acceptances_count"] += accept_count
-            agg["lines_suggested"] += lm.get("loc_suggested_to_add_sum", 0)
-            agg["lines_accepted"] += lm.get("loc_added_sum", 0)
-            if code_count > 0:
-                agg["active_users"] += 1
+        # Primary source: totals_by_language_model (has model granularity)
+        lang_model_entries = user.get("totals_by_language_model", [])
+        # Fallback source: totals_by_language_feature (populated even when
+        # language_model is empty — enterprise API behaviour)
+        lang_feature_entries = user.get("totals_by_language_feature", [])
+
+        if lang_model_entries:
+            for lm in lang_model_entries:
+                language = lm.get("language", "unknown")
+                model = lm.get("model", "unknown")
+                key = (day, language, model)
+                agg = lang_model_agg[key]
+                code_count = lm.get("code_generation_activity_count", 0)
+                accept_count = lm.get("code_acceptance_activity_count", 0)
+                agg["suggestions_count"] += code_count
+                agg["acceptances_count"] += accept_count
+                agg["lines_suggested"] += lm.get("loc_suggested_to_add_sum", 0)
+                agg["lines_accepted"] += lm.get("loc_added_sum", 0)
+                if code_count > 0:
+                    agg["active_users"] += 1
+        elif lang_feature_entries:
+            # Use totals_by_language_feature as fallback — no model field, use
+            # feature name as a stand-in so entries remain distinct per language.
+            for lf in lang_feature_entries:
+                language = lf.get("language", "unknown")
+                model = lf.get("feature", "enterprise-aggregate")
+                key = (day, language, model)
+                agg = lang_model_agg[key]
+                code_count = lf.get("code_generation_activity_count", 0)
+                accept_count = lf.get("code_acceptance_activity_count", 0)
+                agg["suggestions_count"] += code_count
+                agg["acceptances_count"] += accept_count
+                agg["lines_suggested"] += lf.get("loc_suggested_to_add_sum", 0)
+                agg["lines_accepted"] += lf.get("loc_added_sum", 0)
+                if code_count > 0:
+                    agg["active_users"] += 1
 
         # ── IDE / Editor aggregation ──────────────────────────────────────────
         for ide_entry in user.get("totals_by_ide", []):
