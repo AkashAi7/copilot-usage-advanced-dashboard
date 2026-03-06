@@ -1547,36 +1547,59 @@ class ElasticsearchManager:
 
     def __init__(self, primary_key=Paras.primary_key):
         self.primary_key = primary_key
-        if Paras.elasticsearch_user is None or Paras.elasticsearch_pass is None:
-            logger.info("Using Elasticsearch without authentication")
-            self.es = Elasticsearch(
-                hosts=Paras.elasticsearch_url,
-                max_retries=3,
-                retry_on_timeout=True,
-                request_timeout=60,
-            )
+        # Retry creating the ES client to handle transient DNS resolution failures
+        # that can occur immediately after container startup.
+        for attempt in range(1, 13):  # up to ~60 s of DNS-wait
+            try:
+                if Paras.elasticsearch_user is None or Paras.elasticsearch_pass is None:
+                    logger.info("Using Elasticsearch without authentication")
+                    self.es = Elasticsearch(
+                        hosts=Paras.elasticsearch_url,
+                        max_retries=3,
+                        retry_on_timeout=True,
+                        request_timeout=60,
+                    )
+                else:
+                    logger.info("Using basic authentication for Elasticsearch")
+                    self.es = Elasticsearch(
+                        hosts=Paras.elasticsearch_url,
+                        basic_auth=(Paras.elasticsearch_user, Paras.elasticsearch_pass),
+                        max_retries=3,
+                        retry_on_timeout=True,
+                        request_timeout=60,
+                    )
+                # Verify we can reach the host before proceeding
+                self.es.info()
+                break
+            except Exception as e:
+                logger.warning(
+                    f"Elasticsearch not reachable yet (attempt {attempt}/12): {e}. "
+                    "Retrying in 5 s..."
+                )
+                time.sleep(5)
         else:
-            logger.info("Using basic authentication for Elasticsearch")
-            self.es = Elasticsearch(
-                hosts=Paras.elasticsearch_url,
-                basic_auth=(Paras.elasticsearch_user, Paras.elasticsearch_pass),
-                max_retries=3,
-                retry_on_timeout=True,
-                request_timeout=60,
+            logger.error(
+                f"Could not connect to Elasticsearch at {Paras.elasticsearch_url} "
+                "after 12 attempts. Check that the service is running and accessible."
             )
+            raise RuntimeError("Elasticsearch unreachable after repeated DNS/connection failures")
 
         self.check_and_create_indexes()
 
     # Check if all indexes in the indexes are present, and if they don't, they are created based on the files in the mapping folder
     def check_and_create_indexes(self):
 
-        # try ping for 1 minute
+        # try ping for 1 minute — ES is already confirmed reachable from __init__
         for i in range(30):
-            if self.es.ping():
-                logger.info("Elasticsearch is up and running")
-                break
-            else:
-                logger.warning("Elasticsearch is not responding, retrying...")
+            try:
+                if self.es.ping():
+                    logger.info("Elasticsearch is up and running")
+                    break
+                else:
+                    logger.warning("Elasticsearch is not responding, retrying...")
+                    time.sleep(5)
+            except Exception as e:
+                logger.warning(f"Elasticsearch ping error (retry {i+1}/30): {e}")
                 time.sleep(5)
 
         for index_name in Indexes.__dict__:

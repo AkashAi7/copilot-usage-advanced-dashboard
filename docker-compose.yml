@@ -14,6 +14,8 @@ services:
       - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
     mem_limit: 1g
     cpus: 1
+    networks:
+      - copilot-net
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health/"]
       interval: 15s
@@ -32,6 +34,8 @@ services:
     depends_on:
       elasticsearch:
         condition: service_healthy
+    networks:
+      - copilot-net
     volumes:
       - grafana:/var/lib/grafana
       - ./grafana-provisioning/dashboards:/var/lib/grafana/dashboards
@@ -61,6 +65,8 @@ services:
         condition: service_healthy
       cpuad-updater:
         condition: service_started
+    networks:
+      - copilot-net
     environment:
       ELASTICSEARCH_URL: http://elasticsearch:9200
       GRAFANA_URL: http://grafana:80
@@ -77,6 +83,8 @@ services:
     depends_on:
       elasticsearch:
         condition: service_healthy
+    networks:
+      - copilot-net
     environment:
       GITHUB_PAT: ${GITHUB_PAT}
       ORGANIZATION_SLUGS: ${ORGANIZATION_SLUGS:-standalone:octodemo-copilot-standalone}
@@ -91,6 +99,10 @@ services:
       interval: 5m
       timeout: 10s
       retries: 3
+
+networks:
+  copilot-net:
+    driver: bridge
 
 volumes:
   data:
