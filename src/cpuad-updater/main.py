@@ -1613,44 +1613,83 @@ class ElasticsearchManager:
                     logger.info(f"Created index: {index_name}")
                 else:
                     logger.info(f"Index already exists: {index_name}")
+                    # Ensure single-node replica settings are correct on
+                    # pre-existing indexes.  If indexes were created before the
+                    # mapping files gained settings.index.number_of_replicas=0,
+                    # they would have the ES default (1 replica).  On a
+                    # single-node cluster this puts all shards into YELLOW
+                    # state and can make queries return 503 errors.
+                    try:
+                        settings = self.es.indices.get_settings(index=index_name)
+                        current_replicas = int(
+                            settings.get(index_name, {})
+                            .get("settings", {})
+                            .get("index", {})
+                            .get("number_of_replicas", 1)
+                        )
+                        if current_replicas != 0:
+                            logger.warning(
+                                f"Index {index_name} has number_of_replicas="
+                                f"{current_replicas}, updating to 0 for single-node"
+                            )
+                            self.es.indices.put_settings(
+                                index=index_name,
+                                settings={"index": {"number_of_replicas": 0}},
+                            )
+                            logger.info(f"Updated {index_name} to number_of_replicas=0")
+                    except Exception as e:
+                        logger.warning(f"Could not check/update replica settings for {index_name}: {e}")
 
-    def write_to_es(self, index_name, data, update_condition=None):
+    def write_to_es(self, index_name, data, update_condition=None, max_retries=3):
         last_updated_at = current_time()
         data["last_updated_at"] = last_updated_at
         # Add @timestamp for Grafana time-based filtering (ISO 8601 format)
         data["@timestamp"] = datetime.now().isoformat()
         doc_id = data.get(self.primary_key)
-        logger.info(f"Writing data to Elasticsearch index: {index_name}")
-        try:
-            # Get existing document
-            existing_doc = self.es.get(index=index_name, id=doc_id)
+        for attempt in range(1, max_retries + 1):
+            try:
+                # Get existing document
+                existing_doc = self.es.get(index=index_name, id=doc_id)
 
-            # Check update condition if provided
-            if update_condition:
-                should_preserve_fields = True
-                for field, value in update_condition.items():
-                    if (
-                        field not in existing_doc["_source"]
-                        or existing_doc["_source"][field] != value
-                    ):
-                        should_preserve_fields = False
-                        break
+                # Check update condition if provided
+                if update_condition:
+                    should_preserve_fields = True
+                    for field, value in update_condition.items():
+                        if (
+                            field not in existing_doc["_source"]
+                            or existing_doc["_source"][field] != value
+                        ):
+                            should_preserve_fields = False
+                            break
 
-                if should_preserve_fields:
-                    # Preserve fields listed in update_condition by copying their values from existing document
-                    for field in update_condition.keys():
-                        if field in existing_doc["_source"]:
-                            data[field] = existing_doc["_source"][field]
-                    logger.info(
-                        f"[partial update] to [{index_name}]: {doc_id} - preserving fields: {list(update_condition.keys())}"
+                    if should_preserve_fields:
+                        for field in update_condition.keys():
+                            if field in existing_doc["_source"]:
+                                data[field] = existing_doc["_source"][field]
+                        logger.info(
+                            f"[partial update] to [{index_name}]: {doc_id} - preserving fields: {list(update_condition.keys())}"
+                        )
+
+                # Always update document, possibly with some preserved fields
+                self.es.update(index=index_name, id=doc_id, doc=data)
+                logger.info(f"[updated] to [{index_name}]: {doc_id}")
+                return  # success
+            except NotFoundError:
+                self.es.index(index=index_name, id=doc_id, document=data)
+                logger.info(f"[created] to [{index_name}]: {doc_id}")
+                return  # success
+            except Exception as e:
+                if attempt < max_retries:
+                    logger.warning(
+                        f"ES write error for {index_name}/{doc_id} "
+                        f"(attempt {attempt}/{max_retries}): {e}. Retrying in 5s..."
                     )
-
-            # Always update document, possibly with some preserved fields
-            self.es.update(index=index_name, id=doc_id, doc=data)
-            logger.info(f"[updated] to [{index_name}]: {data}")
-        except NotFoundError:
-            self.es.index(index=index_name, id=doc_id, document=data)
-            logger.info(f"[created] to [{index_name}]: {data}")
+                    time.sleep(5)
+                else:
+                    logger.error(
+                        f"Failed to write to {index_name}/{doc_id} after "
+                        f"{max_retries} attempts: {e}"
+                    )
 
 
 def create_breakdown_from_user_metrics(user_metrics_data, organization_slug, es_manager):
@@ -2004,7 +2043,12 @@ def main(organization_slug):
         logger.error(f"Full traceback: {traceback.format_exc()}")
 
     # Process usage data
-    copilot_usage_datas = github_org_manager.get_copilot_usages(team_slug="all")
+    try:
+        copilot_usage_datas = github_org_manager.get_copilot_usages(team_slug="all")
+    except Exception as e:
+        logger.error(f"Failed to fetch Copilot usage data for {slug_type} {organization_slug}: {e}")
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        copilot_usage_datas = {}
     logger.info(f"Processing Copilot usage data for {slug_type}: {organization_slug}")
     for team_slug, data_with_position in copilot_usage_datas.items():
         logger.info(f"Processing Copilot usage data for team: {team_slug}")
