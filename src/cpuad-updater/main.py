@@ -1944,7 +1944,6 @@ def main(organization_slug):
             logger.info(f"Successfully processed {len(user_metrics_data)} user metrics records for {slug_type}: {organization_slug}")
     except Exception as e:
         logger.error(f"Failed to process user metrics for {slug_type} {organization_slug}: {e}")
-        import traceback
         logger.error(f"Full traceback: {traceback.format_exc()}")
 
     # For enterprise/standalone mode: synthesise breakdown, breakdown_chat, and
