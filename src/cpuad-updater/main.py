@@ -717,6 +717,38 @@ class GitHubOrganizationManager:
             url, label=f"{self.organization_slug} {self.slug_type} metrics"
         )
 
+        # ── Legacy API fallback ────────────────────────────────────────────────
+        # The new report endpoint may return metadata (report_start_day /
+        # report_end_day) but empty download_links when the enterprise has not
+        # yet been migrated to the report-based delivery model.  Fall back to
+        # the classic Metrics API which is still active until April 2026.
+        if not raw_data:
+            legacy_url = (
+                f"https://api.github.com/{self.api_type}/{self.organization_slug}"
+                f"/copilot/metrics"
+            )
+            logger.warning(
+                f"New report API returned no data for {self.slug_type} "
+                f"{self.organization_slug}. Falling back to legacy metrics "
+                f"endpoint: {legacy_url}"
+            )
+            raw_data = github_api_request_handler(legacy_url, error_return_value=[])
+            if raw_data:
+                logger.info(
+                    f"Legacy metrics endpoint returned {len(raw_data)} days of "
+                    f"data for {self.slug_type}: {self.organization_slug}"
+                )
+                dict_save_to_json_file(
+                    raw_data,
+                    f"{self.organization_slug}_no-team_copilot_metrics_legacy",
+                    save_to_json=save_to_json,
+                )
+            else:
+                logger.warning(
+                    f"Legacy metrics endpoint also returned no data for "
+                    f"{self.slug_type}: {self.organization_slug}"
+                )
+
         dict_save_to_json_file(
             raw_data,
             f"{self.organization_slug}_no-team_copilot_metrics",
@@ -997,6 +1029,107 @@ class GitHubOrganizationManager:
 
         return teams
 
+    def _metrics_to_synthetic_user_records(self, metrics_days, team_lookup=None):
+        """
+        Convert classic /copilot/metrics day-level aggregate data into synthetic
+        per-day "enterprise-aggregate" user records that `create_breakdown_from_user_metrics`
+        and the adoption leaderboard can consume.
+
+        Each element of `metrics_days` looks like:
+          {
+            "date": "2025-11-26",
+            "copilot_ide_code_completions": { "editors": [ {...} ] },
+            "copilot_ide_chat": { "editors": [ {...} ] },
+            "total_active_users": 171,
+            ...
+          }
+
+        One synthetic user record is emitted per day with
+        user_login = "enterprise-aggregate".
+        """
+        records = []
+        current_time_str = current_time()
+
+        for day_data in metrics_days:
+            day = day_data.get("date")
+            if not day:
+                continue
+
+            # ── Build totals_by_language_model from code completions ────────────
+            totals_by_language_model = []
+            totals_by_ide = []
+            total_gen = 0
+            total_accept = 0
+            total_chat = 0
+
+            code_completions = day_data.get("copilot_ide_code_completions") or {}
+            for editor in code_completions.get("editors", []):
+                editor_name = editor.get("name", "unknown")
+                for model_entry in editor.get("models", []):
+                    model_name = model_entry.get("name", "unknown")
+                    for lang in model_entry.get("languages", []):
+                        suggestions = lang.get("total_code_suggestions", 0)
+                        acceptances = lang.get("total_code_acceptances", 0)
+                        totals_by_language_model.append({
+                            "language": lang.get("name", "unknown"),
+                            "model": model_name,
+                            "code_generation_activity_count": suggestions,
+                            "code_acceptance_activity_count": acceptances,
+                            "loc_suggested_to_add_sum": lang.get("total_code_lines_suggested", 0),
+                            "loc_added_sum": lang.get("total_code_lines_accepted", 0),
+                        })
+                        total_gen += suggestions
+                        total_accept += acceptances
+
+            # ── Build totals_by_ide from IDE chat data ──────────────────────────
+            ide_chat = day_data.get("copilot_ide_chat") or {}
+            for editor in ide_chat.get("editors", []):
+                editor_name = editor.get("name", "unknown")
+                editor_chats = sum(
+                    m.get("total_chats", 0)
+                    for m in editor.get("models", [])
+                )
+                totals_by_ide.append({
+                    "ide": editor_name,
+                    "user_initiated_interaction_count": editor_chats,
+                    "code_acceptance_activity_count": 0,
+                })
+                total_chat += editor_chats
+
+            record = {
+                "user_login": "enterprise-aggregate",
+                "day": day,
+                "organization_slug": self.organization_slug,
+                "slug_type": self.slug_type,
+                "last_updated_at": current_time_str,
+                "utc_offset": self.utc_offset,
+                "team_slug": "no-team",
+                "totals_by_language_model": totals_by_language_model,
+                "totals_by_language_feature": [],
+                "totals_by_ide": totals_by_ide,
+                "code_generation_activity_count": total_gen,
+                "code_acceptance_activity_count": total_accept,
+                "user_initiated_interaction_count": total_chat,
+                "loc_suggested_to_add_sum": sum(
+                    e.get("loc_suggested_to_add_sum", 0)
+                    for e in totals_by_language_model
+                ),
+                "loc_added_sum": sum(
+                    e.get("loc_added_sum", 0)
+                    for e in totals_by_language_model
+                ),
+                "used_chat": total_chat > 0,
+                "used_agent": False,
+                "is_synthetic": True,
+            }
+            record["unique_hash"] = generate_unique_hash(
+                record,
+                key_properties=["organization_slug", "user_login", "day"],
+            )
+            records.append(record)
+
+        return records
+
     def get_copilot_user_metrics(self, save_to_json=True, team_lookup=None):
         """
         Fetch Copilot user metrics for the last 28 days.
@@ -1076,7 +1209,46 @@ class GitHubOrganizationManager:
         api_response = github_api_request_handler(url, error_return_value={})
         
         if not api_response or 'download_links' not in api_response:
-            logger.warning("No download links received from user metrics API")
+            logger.warning(
+                f"No download links received from user metrics report API for "
+                f"{self.slug_type}: {self.organization_slug}. "
+                f"Attempting legacy metrics endpoint to synthesise aggregate records."
+            )
+            # ── Legacy fallback: synthesise per-day aggregate user records ──────
+            # The classic /copilot/metrics endpoint returns day-level aggregate data
+            # (not per user), but we can convert each day into a single synthetic
+            # "enterprise-aggregate" record enriched with language/model and IDE
+            # breakdowns so that create_breakdown_from_user_metrics() can still
+            # populate the Languages/Editors/Teams Grafana panels.
+            legacy_url = (
+                f"https://api.github.com/{self.api_type}/{self.organization_slug}"
+                f"/copilot/metrics"
+            )
+            legacy_metrics = github_api_request_handler(legacy_url, error_return_value=[])
+            if legacy_metrics:
+                logger.info(
+                    f"Legacy metrics endpoint returned {len(legacy_metrics)} days; "
+                    f"synthesising aggregate user records for breakdown panels."
+                )
+                synthetic_records = self._metrics_to_synthetic_user_records(
+                    legacy_metrics, team_lookup=team_lookup
+                )
+                # Persist synthetic records so other parts of the pipeline can
+                # inspect them if needed.
+                dict_save_to_json_file(
+                    synthetic_records,
+                    f"{self.organization_slug}_copilot_user_metrics_synthetic",
+                    save_to_json=save_to_json,
+                )
+                logger.info(
+                    f"Created {len(synthetic_records)} synthetic aggregate records "
+                    f"from legacy metrics for {self.slug_type}: {self.organization_slug}"
+                )
+                return synthetic_records
+            logger.warning(
+                f"Legacy metrics endpoint also returned no data for "
+                f"{self.slug_type}: {self.organization_slug}. User metrics will be empty."
+            )
             return []
         
         download_links = api_response.get('download_links', [])
