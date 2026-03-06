@@ -223,6 +223,23 @@ docker compose logs init-grafana
 
 ## Troubleshooting
 
+### Issue: Elasticsearch Not Healthy / Timeout
+The most common cause on a fresh Linux VM is the missing kernel setting:
+```bash
+# Check current value (needs to be at least 262144)
+cat /proc/sys/vm/max_map_count
+
+# Fix (required by Elasticsearch)
+sudo sysctl -w vm.max_map_count=262144
+
+# Make it persist across reboots
+echo 'vm.max_map_count=262144' | sudo tee -a /etc/sysctl.conf
+
+# Then restart the containers
+docker compose down
+docker compose up -d
+```
+
 ### Issue: Permission Denied Errors
 ```bash
 sudo chown -R $USER:$USER ~/copilot-usage-advanced-dashboard

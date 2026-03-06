@@ -221,6 +221,22 @@ fi
 # ── 5. Ensure grafana-provisioning/dashboards dir exists ──────────────────────
 mkdir -p "$SCRIPT_DIR/grafana-provisioning/dashboards"
 
+# ── 5. Kernel tuning required by Elasticsearch ───────────────────────────────
+header "Applying kernel settings for Elasticsearch"
+
+CURRENT_MAP_COUNT=$(cat /proc/sys/vm/max_map_count 2>/dev/null || echo 0)
+if (( CURRENT_MAP_COUNT < 262144 )); then
+  info "Setting vm.max_map_count=262144 (required by Elasticsearch, current: ${CURRENT_MAP_COUNT})"
+  sudo sysctl -w vm.max_map_count=262144
+  # Persist across reboots
+  if ! grep -q 'vm.max_map_count' /etc/sysctl.conf 2>/dev/null; then
+    echo 'vm.max_map_count=262144' | sudo tee -a /etc/sysctl.conf > /dev/null
+  fi
+  success "vm.max_map_count set to 262144"
+else
+  success "vm.max_map_count already OK (${CURRENT_MAP_COUNT})"
+fi
+
 # ── 6. Pull / build and start ─────────────────────────────────────────────────
 header "Starting services (this may take a few minutes on first run)"
 
@@ -232,11 +248,15 @@ header "Waiting for services to become healthy"
 
 wait_for_url() {
   local name="$1" url="$2" max_wait="${3:-120}" interval=5
+  local service_name
+  service_name=$(echo "$name" | tr '[:upper:]' '[:lower:]')
   local elapsed=0
   info "Waiting for $name at $url …"
   while ! curl -sf "$url" &>/dev/null; do
     if (( elapsed >= max_wait )); then
-      warn "$name did not become healthy within ${max_wait}s. Check: $COMPOSE_CMD logs $name"
+      warn "$name did not become healthy within ${max_wait}s."
+      warn "Check logs with: $COMPOSE_CMD logs $service_name --tail=50"
+      warn "Common fix:    sudo sysctl -w vm.max_map_count=262144 && $COMPOSE_CMD restart $service_name"
       return 1
     fi
     sleep $interval
@@ -247,8 +267,8 @@ wait_for_url() {
   success "$name is up!"
 }
 
-wait_for_url "Elasticsearch" "http://localhost:9200/_cluster/health" 180
-wait_for_url "Grafana"       "http://localhost:3000/api/health"       180
+wait_for_url "Elasticsearch" "http://localhost:9200/_cluster/health" 300
+wait_for_url "Grafana"       "http://localhost:3000/api/health"       300
 
 # ── 8. Detect IP addresses ───────────────────────────────────────────────────
 header "Detecting access URLs"
