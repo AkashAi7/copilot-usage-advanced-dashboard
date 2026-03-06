@@ -351,6 +351,58 @@ If `localhost` works but the public IP doesn't → NSG is blocking.
 
 ## Troubleshooting
 
+### Full Clean Reinstall (Nuclear Option)
+
+If things aren't working, wipe everything and start fresh:
+
+```bash
+# Stop and remove all containers + volumes
+cd ~/copilot-usage-advanced-dashboard
+sudo docker compose down -v --remove-orphans
+
+# Remove all Docker images for this project
+sudo docker rmi $(sudo docker images --filter "reference=copilot-usage-advanced-dashboard*" -q) 2>/dev/null; true
+
+# Delete the repo entirely
+cd ~
+rm -rf copilot-usage-advanced-dashboard
+
+# Fresh clone
+git clone https://github.com/AkashAi7/copilot-usage-advanced-dashboard.git
+cd copilot-usage-advanced-dashboard
+
+# Kernel tuning
+sudo sysctl -w vm.max_map_count=262144
+grep -q 'vm.max_map_count' /etc/sysctl.conf || echo 'vm.max_map_count=262144' | sudo tee -a /etc/sysctl.conf
+
+# Create .env
+cat > .env <<EOF
+GITHUB_PAT=ghp_your_token_here
+ORGANIZATION_SLUGS=standalone:your-enterprise-slug
+EXECUTION_INTERVAL_HOURS=1
+EOF
+
+# Dashboard placeholder
+echo '{}' > user_advance_metrics_dashboard.json
+mkdir -p grafana-provisioning/dashboards
+
+# Build and start
+sudo docker compose up -d --build
+
+# Watch logs (wait for "Finished Successfully")
+sudo docker compose logs -f cpuad-updater --tail=50
+```
+
+After `"Finished Successfully"` appears, verify indexes:
+
+```bash
+for idx in copilot_seat_info_settings copilot_seat_assignments copilot_usage_total copilot_usage_breakdown copilot_usage_breakdown_chat copilot_user_metrics copilot_user_adoption; do
+  echo -n "$idx: "; curl -s http://localhost:9200/$idx/_count | jq .count
+done
+```
+
+All counts should be non-zero. Then open `http://<VM_IP>:3000` (admin / copilot).
+
 ### Elasticsearch exits with code 137 (OOM)
 
 ```bash
