@@ -772,6 +772,59 @@ class GitHubOrganizationManager:
             }
         }
 
+        # ── Per-team metrics (enterprise legacy API only) ──────────────────────
+        # The legacy /copilot/metrics endpoint also supports per-team queries:
+        #   GET /enterprises/{ent}/team/{team_slug}/copilot/metrics
+        # Fetch metrics for each team so the Grafana Teams panel shows individual
+        # team breakdowns instead of only "no-team".
+        if self.api_type == "enterprises" and raw_data:
+            try:
+                teams = self._fetch_all_teams(save_to_json=save_to_json)
+                team_slugs = [t.get("slug") for t in teams if t.get("slug")]
+                logger.info(
+                    f"Fetching per-team metrics for {len(team_slugs)} teams "
+                    f"under enterprise: {self.organization_slug}"
+                )
+                for ts in team_slugs:
+                    team_url = (
+                        f"https://api.github.com/{self.api_type}/"
+                        f"{self.organization_slug}/team/{ts}/copilot/metrics"
+                    )
+                    team_raw = github_api_request_handler(
+                        team_url, error_return_value=[]
+                    )
+                    if team_raw:
+                        team_usage = convert_metrics_to_usage(team_raw)
+                        if team_usage:
+                            # Determine position based on team hierarchy
+                            team_obj = next(
+                                (t for t in teams if t.get("slug") == ts), {}
+                            )
+                            pos = team_obj.get("position_in_tree", "leaf_team")
+                            datas[ts] = {
+                                "position_in_tree": pos,
+                                "copilot_usage_data": team_usage,
+                            }
+                            logger.info(
+                                f"  Team '{ts}': {len(team_usage)} days of data"
+                            )
+                            dict_save_to_json_file(
+                                team_usage,
+                                f"{self.organization_slug}_{ts}_copilot_usage",
+                                save_to_json=save_to_json,
+                            )
+                    else:
+                        logger.info(f"  Team '{ts}': no data")
+                logger.info(
+                    f"Fetched per-team metrics for {len(datas) - 1} teams "
+                    f"(+ enterprise-wide 'no-team')"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to fetch per-team metrics: {e}. "
+                    f"Enterprise-wide data is still available under 'no-team'."
+                )
+
         dict_save_to_json_file(
             datas,
             f"{self.organization_slug}_all_teams_copilot_usage",
@@ -780,7 +833,8 @@ class GitHubOrganizationManager:
 
         logger.info(
             f"Fetched {len(usage_data)} days of metrics for "
-            f"{self.slug_type}: {self.organization_slug}"
+            f"{self.slug_type}: {self.organization_slug} "
+            f"({len(datas)} team entries)"
         )
         return datas
 
